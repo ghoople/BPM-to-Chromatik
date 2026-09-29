@@ -23,30 +23,41 @@ Two pieces:
 from source against modern NumPy/Python on Apple Silicon. Homebrew's
 `aubio` formula, however, builds and ships working Python bindings against
 its own Python — so instead of fighting pip, this project's virtualenv is
-created with `--system-site-packages` so it can see Homebrew's
-already-working `aubio` + `numpy`, while `sounddevice` and `python-osc`
-(both pure-Python-friendly, no build issues) install normally into the
-venv.
+built on **Homebrew's Python** with `--system-site-packages` so it can see
+Homebrew's already-working `aubio` + `numpy`, while `sounddevice` and
+`python-osc` (both pure-Python-friendly, no build issues) install normally
+into the venv via [uv](https://docs.astral.sh/uv/).
+
+That's also why `aubio` and `numpy` are deliberately missing from
+`pyproject.toml`: listing them would make uv install PyPI copies into the
+venv that shadow Homebrew's working ones. And `pyproject.toml` sets
+`python-preference = "only-system"` so uv never swaps in one of its own
+downloaded Pythons (which can't see Homebrew's packages).
 
 ## Setup
 
 ```bash
 brew install aubio            # provides the C library + working Python bindings
 brew install python-tk@3.14   # only needed for the GUI (Homebrew's Python doesn't bundle Tk)
-python3 -m venv --system-site-packages .venv
-./.venv/bin/pip install -r requirements.txt
+uv venv --python /opt/homebrew/bin/python3.14 --system-site-packages
+uv sync                       # installs sounddevice + python-osc from pyproject.toml
 ```
 
 Verify aubio is visible from the venv:
 
 ```bash
-./.venv/bin/python -c "import aubio; print(aubio.version)"
+uv run python -c "import aubio; print(aubio.version)"
 ```
+
+If that ever fails with `No module named 'aubio'` (e.g. after a Homebrew
+Python upgrade), delete `.venv` and re-run the `uv venv` + `uv sync` steps
+above — a plain `uv sync` alone recreates the venv *without*
+`--system-site-packages`.
 
 ## GUI
 
 ```bash
-./.venv/bin/python bpm_to_chromatik_gui.py
+uv run python bpm_to_chromatik_gui.py
 ```
 
 Pick an audio input from the dropdown, set the OSC host/port/addresses
@@ -123,8 +134,8 @@ For scripting, or targeting something other than Chromatik (the
 Resolume's normalized tempo convention rather than Chromatik's):
 
 ```bash
-./.venv/bin/python bpm_to_chromatik.py --list-devices
-./.venv/bin/python bpm_to_chromatik.py --device "Samson GoMic" --host 127.0.0.1 --port 7000
+uv run python bpm_to_chromatik.py --list-devices
+uv run python bpm_to_chromatik.py --device "Samson GoMic" --host 127.0.0.1 --port 7000
 ```
 
 `--device` matches a substring of the device name (case-insensitive) or an
@@ -138,7 +149,7 @@ a loopback device and select it the same way:
 brew install blackhole-2ch
 # Audio MIDI Setup -> create a Multi-Output Device with BlackHole + your
 # speakers, set it as your system output, then:
-./.venv/bin/python bpm_to_chromatik.py --device "BlackHole"
+uv run python bpm_to_chromatik.py --device "BlackHole"
 ```
 
 ### Flags
@@ -151,4 +162,4 @@ brew install blackhole-2ch
 - `--buf-size` — aubio hop size in samples (default `128`, same as the original)
 - `--quiet` — suppress the per-beat console line
 
-Run `./.venv/bin/python bpm_to_chromatik.py --help` for the full list.
+Run `uv run python bpm_to_chromatik.py --help` for the full list.

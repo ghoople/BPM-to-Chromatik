@@ -1,2 +1,0 @@
-sounddevice>=0.4.6
-python-osc>=1.8

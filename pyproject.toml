@@ -1,0 +1,22 @@
+[project]
+name = "bpm-to-chromatik"
+version = "0.1.0"
+description = "Detect BPM from live audio with aubio and stream it to Chromatik over OSC"
+readme = "README.md"
+authors = [
+    { name = "Gordon Hoople", email = "ghoople@gmail.com" }
+]
+requires-python = ">=3.14"
+# aubio and numpy are intentionally NOT listed: they come from Homebrew's
+# Python via --system-site-packages (see README). Listing them here would make
+# uv install PyPI copies into the venv that shadow Homebrew's working ones.
+dependencies = [
+    "python-osc>=1.8",
+    "sounddevice>=0.4.6",
+]
+
+[tool.uv]
+# Plain scripts, not an installable package — just manage the venv + deps.
+package = false
+# Never use uv's downloaded Pythons — only Homebrew's has aubio installed.
+python-preference = "only-system"
