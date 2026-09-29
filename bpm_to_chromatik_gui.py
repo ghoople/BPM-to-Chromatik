@@ -7,7 +7,10 @@ Run it directly (e.g. from a VS Code Python session):
     ./.venv/bin/python bpm_to_chromatik_gui.py
 """
 
+import heapq
+import itertools
 import queue
+import statistics
 import threading
 import time
 import tkinter as tk
@@ -30,11 +33,93 @@ MAX_BPM = 200.0
 BEATS_PER_BAR = 4
 TAP_SEQUENCE_GAP = 2.0       # seconds; a gap this big starts a fresh tap sequence
 TAP_IDLE_TIMEOUT_MS = 5 * 60 * 1000  # revert to Algorithm after 5 min with no taps
+MAX_DELAY_MS = 1000
+CALIBRATION_TAPS = 8
+CALIBRATION_MIN_BEATS = 4    # detected beats needed before a tap can be measured
+CALIBRATION_EARLY_TOLERANCE = 0.05   # seconds; a tap this far ahead of the beat still counts
+CALIBRATION_MAX_SPREAD = 0.04        # seconds; warn if tap offsets scatter more than this
 
 ALGO_COLOR = "#2b7de0"
 TAP_COLOR = "#e0432b"
 MANUAL_COLOR = "#8a4fdb"
 IDLE_COLOR = "#444444"
+
+
+class DelayedSender:
+    """Runs callables after a delay on a worker thread. A time-ordered heap
+    (not a FIFO) so changing the delay live can't reorder messages."""
+
+    def __init__(self):
+        self._heap = []
+        self._seq = itertools.count()
+        self._cond = threading.Condition()
+        self._closed = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def schedule(self, delay_s, fn):
+        with self._cond:
+            if self._closed:
+                return
+            heapq.heappush(self._heap, (time.monotonic() + delay_s, next(self._seq), fn))
+            self._cond.notify()
+
+    def clear(self):
+        with self._cond:
+            self._heap.clear()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._heap.clear()
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._closed:
+                    if not self._heap:
+                        self._cond.wait()
+                        continue
+                    wait = self._heap[0][0] - time.monotonic()
+                    if wait <= 0:
+                        break
+                    self._cond.wait(wait)
+                if self._closed:
+                    return
+                _, _, fn = heapq.heappop(self._heap)
+            try:
+                fn()
+            except Exception:
+                pass  # a failed send must not kill the worker
+
+
+def tap_offset(tap_time, beat_times, current_delay_s, max_delay_s=MAX_DELAY_MS / 1000):
+    """How late (seconds) a tap landed after the detected beats, i.e. the
+    playback lag. None if there aren't enough beats to tell.
+
+    The nearest detected beat is only unambiguous modulo the beat period, so
+    among the equivalent offsets (base + k * period) pick the plausible one
+    closest to the delay currently set."""
+    if len(beat_times) < CALIBRATION_MIN_BEATS:
+        return None
+    beats = list(beat_times)
+    period = statistics.median(b - a for a, b in zip(beats, beats[1:]))
+    if period <= 0:
+        return None
+    base = tap_time - min(beats, key=lambda b: abs(tap_time - b))
+    candidates = [base + k * period for k in range(-3, 4)]
+    plausible = [c for c in candidates
+                 if -CALIBRATION_EARLY_TOLERANCE <= c <= max_delay_s]
+    if not plausible:
+        return base
+    return min(plausible, key=lambda c: abs(c - current_delay_s))
+
+
+def summarize_offsets(offsets):
+    """(median, spread) of tap offsets; spread is the median absolute deviation."""
+    median = statistics.median(offsets)
+    spread = statistics.median(abs(o - median) for o in offsets)
+    return median, spread
 
 
 class App:
@@ -50,6 +135,14 @@ class App:
 
         self.bar_position = 1  # 1-indexed position within the bar; 1 = downbeat
         self._bar_lock = threading.Lock()
+
+        self.sender = None  # DelayedSender, alive while running
+        self._delay_s = 0.0  # plain attr, read from the audio thread
+        self.beat_times = deque(maxlen=16)  # detection times, audio thread -> GUI
+        self._beat_lock = threading.Lock()
+        self._calibrating = False
+        self._calib_offsets = []
+        self._calib_last_tap = None
 
         self._active_source = "algorithm"  # plain attr, read from background threads
         self.tap_times = deque(maxlen=8)
@@ -163,8 +256,26 @@ class App:
                                             command=self._mark_beat_one, state="disabled")
         self.mark_beat_button.grid(row=0, column=1, sticky="e")
 
+        delay_frame = ttk.LabelFrame(self.root, text="Sync Delay (Algorithm only)")
+        delay_frame.grid(row=6, column=0, sticky="ew", **pad)
+        delay_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(delay_frame, text="Delay (ms)").grid(row=0, column=0, padx=8, pady=6)
+        self.delay_var = tk.StringVar(value="0")
+        self.delay_var.trace_add("write", self._on_delay_change)
+        ttk.Spinbox(delay_frame, from_=0, to=MAX_DELAY_MS, increment=5, width=6,
+                    textvariable=self.delay_var).grid(row=0, column=1, padx=(0, 8), pady=6)
+
+        self.calibrate_button = ttk.Button(delay_frame, text="Calibrate",
+                                            command=self._toggle_calibration, state="disabled")
+        self.calibrate_button.grid(row=0, column=2, padx=(0, 8), pady=6)
+
+        self.calib_var = tk.StringVar(value="")
+        ttk.Label(delay_frame, textvariable=self.calib_var).grid(
+            row=0, column=3, sticky="w", padx=(0, 8))
+
         control_frame = ttk.Frame(self.root)
-        control_frame.grid(row=6, column=0, sticky="ew", **pad)
+        control_frame.grid(row=7, column=0, sticky="ew", **pad)
         control_frame.columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Stopped")
@@ -225,6 +336,9 @@ class App:
 
         detector = BeatDetector(samplerate=SAMPLERATE, buf_size=BUF_SIZE)
         self.bar_position = 1
+        with self._beat_lock:
+            self.beat_times.clear()
+        self._calibrating = False
         self.tap_times.clear()
         self.tapped_bpm = None
         self.algo_bpm_var.set("--")
@@ -235,6 +349,7 @@ class App:
         self.osc = OSCSink(host, port, address, beat_address=None,
                             beat_in_bar_address=beat_in_bar_address,
                             raw=True, min_bpm=MIN_BPM, max_bpm=MAX_BPM)
+        sender = self.sender = DelayedSender()
 
         def callback(indata, frames, time_info, status):
             mono = indata.mean(axis=1) if indata.ndim > 1 else indata[:, 0]
@@ -242,14 +357,25 @@ class App:
             beat, bpm = detector.process(mono)
             if not beat:
                 return
+            # recorded before any delay so calibration is independent of it
+            with self._beat_lock:
+                self.beat_times.append(time.monotonic())
             if self._active_source == "algorithm":
                 with self._bar_lock:
                     position = self.bar_position
                     self.bar_position = self.bar_position % BEATS_PER_BAR + 1
-                self.osc.send_beat_in_bar(position)
-                if MIN_BPM < bpm < MAX_BPM:
-                    self.osc.send_bpm(bpm)
-                self.events.put(("algorithm", bpm, position))
+
+                def emit(bpm=bpm, position=position):
+                    osc = self.osc
+                    # Tapped may have taken over while this beat was waiting
+                    if osc is None or self._active_source != "algorithm":
+                        return
+                    osc.send_beat_in_bar(position)
+                    if MIN_BPM < bpm < MAX_BPM:
+                        osc.send_bpm(bpm)
+                    self.events.put(("algorithm", bpm, position))
+
+                sender.schedule(self._delay_s, emit)
             else:
                 # still report the algorithm's BPM for comparison, but don't
                 # touch the shared bar counter or send anything - Tapped is driving
@@ -272,6 +398,8 @@ class App:
         self.algo_radio.state(["!disabled"])
         self.tapped_radio.state(["!disabled"])
         self.tap_button.state(["!disabled"])
+        self.calibrate_button.state(["!disabled"])
+        self.calib_var.set("")
         self.bar_position_var.set(f"Beat -- of {BEATS_PER_BAR}")
         self.status_var.set(f"Running -> {host}:{port}{address}")
 
@@ -282,7 +410,12 @@ class App:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        if self.sender is not None:
+            self.sender.close()
+            self.sender = None
         self.osc = None
+        self._end_calibration()
+        self.calibrate_button.state(["disabled"])
         self.device_combo.state(["!disabled"])
         self.start_button.config(text="Start")
         self.mark_beat_button.state(["disabled"])
@@ -300,11 +433,63 @@ class App:
     def _mark_beat_one(self):
         if self.osc is None:
             return
+        if self.sender is not None:
+            self.sender.clear()  # drop delayed beats carrying the old bar position
         with self._bar_lock:
             self.bar_position = 2
         self.osc.send_beat_in_bar(1)
         self.bar_position_var.set(f"Beat 1 of {BEATS_PER_BAR}")
         self._flash_dot(MANUAL_COLOR)
+
+    # ---- sync delay ------------------------------------------------------
+
+    def _on_delay_change(self, *_args):
+        try:
+            ms = float(self.delay_var.get())
+        except ValueError:
+            return  # half-typed value; keep the last good delay
+        self._delay_s = min(max(ms, 0.0), MAX_DELAY_MS) / 1000.0
+
+    def _toggle_calibration(self):
+        if self._calibrating:
+            self._end_calibration()
+            self.calib_var.set("Calibration cancelled")
+        elif self.osc is not None:
+            self._calibrating = True
+            self._calib_offsets = []
+            self._calib_last_tap = None
+            self.calibrate_button.config(text="Cancel")
+            self.calib_var.set(f"Tap along with the speakers: 0/{CALIBRATION_TAPS}")
+
+    def _end_calibration(self):
+        self._calibrating = False
+        self.calibrate_button.config(text="Calibrate")
+
+    def _calibration_tap(self, now):
+        if self._calib_last_tap is not None and now - self._calib_last_tap > TAP_SEQUENCE_GAP:
+            self._calib_offsets = []  # long pause: start the run over
+        self._calib_last_tap = now
+        with self._beat_lock:
+            beats = list(self.beat_times)
+        offset = tap_offset(now, beats, self._delay_s)
+        if offset is None:
+            self.calib_var.set("Not enough beats detected yet - keep tapping")
+            return
+        self._calib_offsets.append(offset)
+        if len(self._calib_offsets) < CALIBRATION_TAPS:
+            self.calib_var.set(
+                f"Tap along with the speakers: {len(self._calib_offsets)}/{CALIBRATION_TAPS}")
+            return
+        median, spread = summarize_offsets(self._calib_offsets)
+        self._end_calibration()
+        ms = int(round(min(max(median, 0.0), MAX_DELAY_MS / 1000) * 1000))
+        self.delay_var.set(str(ms))
+        message = f"Delay set to {ms} ms (\u00b1{spread * 1000:.0f})"
+        if median < 0:
+            message = f"Taps were ahead of the beat; delay set to 0 ms (\u00b1{spread * 1000:.0f})"
+        elif spread > CALIBRATION_MAX_SPREAD:
+            message += " - taps were scattered, consider retrying"
+        self.calib_var.set(message)
 
     # ---- tap tempo -------------------------------------------------------
 
@@ -312,6 +497,9 @@ class App:
         if self.osc is None:
             return
         now = time.monotonic()
+        if self._calibrating:
+            self._calibration_tap(now)
+            return
         if self.tap_times and (now - self.tap_times[-1]) > TAP_SEQUENCE_GAP:
             self.tap_times.clear()
         self.tap_times.append(now)
@@ -344,6 +532,8 @@ class App:
         source = self.active_source_var.get()
         self._active_source = source
         if source == "tapped":
+            if self.sender is not None:
+                self.sender.clear()
             self._start_metronome()
             self._reset_tap_timeout()
         else:
